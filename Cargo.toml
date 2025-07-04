@@ -2,42 +2,47 @@
 [package]
 name = "irfarp_system"
 version = "0.1.0"
-edition = "2021" # Changed to 2021, as 2025 is a future edition
+edition = "2021"
 
 [dependencies]
-tokio = { version = "1.38.0", features = ["full"] } # Updated to latest stable
-serde = { version = "1.0.203", features = ["derive"] } # Updated to latest stable
-serde_json = "1.0.120" # Updated to latest stable
-log = "0.4.22" # Updated to latest stable
-env_logger = "0.11.3" # Updated to latest stable
-chrono = { version = "0.4.38", features = ["serde"] } # Updated to latest stable
+tokio = { version = "1.38.0", features = ["full"] }
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.120"
+log = "0.4.22"
+env_logger = "0.11.3"
+chrono = { version = "0.4.38", features = ["serde"] }
 
 # Cryptographically Secure Random Number Generator
-rand = "0.8.5" # Updated to latest stable
-getrandom = { version = "0.2.12", features = ["js"] } # Updated to latest stable
+rand = "0.8.5"
+getrandom = { version = "0.2.12", features = ["js"] }
 
 # Authenticated Encryption (AES-256-GCM)
-aes-gcm = { version = "0.10.1", features = ["aes_ni"] } # Updated to latest stable
+aes-gcm = { version = "0.10.1", features = ["aes_ni"] }
 # Key Derivation Function (HKDF-SHA256)
-hkdf = "0.12.0" # Updated to latest stable
-sha2 = "0.10.8" # Updated to latest stable
+hkdf = "0.12.0"
+sha2 = "0.10.8"
 
 # Binary Serialization for custom protocol headers
-bincode = "1.3.3" # Updated to latest stable
+bincode = "1.3.3"
 
 # For base64 encoding/decoding of the master key
-base64 = "0.21.7" # Updated to latest stable
+base64 = "0.21.7"
 
 # For explicit endianness handling (useful for low-level protocol parsing)
-byteorder = "1.5.0" # Updated to latest stable
+byteorder = "1.5.0"
 
 # For raw socket capabilities on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.153" # Updated to latest stable
+libc = "0.2.153"
 
 [profile.release]
 # Optimize for binary size and performance, crucial for low-resource devices
-opt-level = "s"  # Optimize for size. "z" is even smaller but might be slower.
-lto = true       # Link Time Optimization: whole-program optimization
-codegen-units = 1 # Reduces parallelism during compilation but enables more aggressive optimizations
-strip = true     # Strip debug info and symbols from the binary
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# Explicitly define the binary target
+[[bin]]
+name = "irfarp_system" # The name of your executable binary
+path = "src/main.rs" # Path to the main source file for this binary
