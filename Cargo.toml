@@ -45,4 +45,4 @@ strip = true
 # Explicitly define the binary target
 [[bin]]
 name = "irfarp_system" # The name of your executable binary
-path = "src/main.rs" # Path to the main source file for this binary
+path = "main.rs" # Path to the main source file for this binary
