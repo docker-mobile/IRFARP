@@ -2,7 +2,7 @@
 [package]
 name = "irfarp_system"
 version = "0.1.0"
-edition = "2024" 
+edition = "2021" # Changed to 2021, as 2025 is a future edition
 
 [dependencies]
 tokio = { version = "1.38.0", features = ["full"] } # Updated to latest stable
