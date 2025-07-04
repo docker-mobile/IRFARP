@@ -1,0 +1,82 @@
+# .github/workflows/release.yml
+
+name: IRFARP Linux Release
+
+# This workflow triggers on:
+# - Pushes to the 'main' branch (for continuous integration builds and artifact generation).
+# - Creation of a new tag (e.g., v1.0.0) for creating a GitHub Release.
+on:
+  push:
+    branches:
+      - main
+  release:
+    types: [published] # Triggered when a release is published (tag is created and released)
+
+jobs:
+  build:
+    name: Build for x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable # Uses the latest stable Rust toolchain
+        with:
+          target: x86_64-unknown-linux-gnu # Specify the target architecture
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: irfarp-system-x86_64-linux
+          path: target/x86_64-unknown-linux-gnu/release/irfarp_system # Path to the compiled executable
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build # This job depends on the 'build' job completing successfully
+    if: github.event_name == 'release' && github.event.action == 'published' # Only run if a release is published
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: irfarp-system-x86_64-linux # Name of the artifact to download
+
+      - name: Make executable
+        run: chmod +x irfarp_system # Ensure the downloaded binary is executable
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1 # Action to create and manage GitHub Releases
+        with:
+          files: irfarp_system # Upload the executable as a release asset
+          tag_name: ${{ github.ref_name }} # Use the tag name from the release event (e.g., v1.0.0)
+          name: Release ${{ github.ref_name }}
+          body: |
+            # IRFARP System Release ${{ github.ref_name }}
+
+            This release provides the `irfarp_system` executable for x86_64 Linux.
+
+            ## Usage:
+            Download the `irfarp_system` binary.
+            Grant raw socket capabilities (Linux only): `sudo setcap cap_net_raw+ep ./irfarp_system`
+            Run with your configuration: `./irfarp_system server server_config.json` or `./irfarp_system client client_config.json`
+
+            See the main `README.md` for full setup and configuration details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub automatically provides this token for release creation
