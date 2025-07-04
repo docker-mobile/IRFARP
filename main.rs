@@ -23,7 +23,6 @@ use std::{
     io::{self, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::Path,
-    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -41,9 +40,9 @@ use sha2::Sha256;
 use bincode::{serialize, deserialize}; // For robust binary serialization
 use base64::{engine::general_purpose, Engine as _}; // For base64 encoding/decoding of master key
 use byteorder::{ByteOrder, BigEndian}; // For explicit endianness in network parsing
-use tokio::sync::mpsc; // FIX: Added missing mpsc import
-use tokio::io::{AsyncReadExt, AsyncWriteExt}; // FIX: Added missing AsyncReadExt and AsyncWriteExt imports
-use async_trait::async_trait; // FIX: Added async_trait import for dyn compatibility
+use tokio::sync::{mpsc, Mutex, Arc}; // FIX: Changed std::sync::{Arc, Mutex} to tokio::sync::{Arc, Mutex}
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use async_trait::async_trait;
 
 // For raw socket operations on Linux (moved imports inside cfg block)
 #[cfg(target_os = "linux")]
@@ -119,7 +118,7 @@ impl IrpCipher {
     /// This nonce is then sent in the packet header.
     fn encrypt(&self, plaintext: &[u8]) -> io::Result<(Vec<u8>, [u8; 12])> {
         let nonce_bytes = get_csprng_bytes::<12>(); // GCM recommends 12-byte nonces
-        let nonce = Nonce::from_slice(&nonce_bytes); // FIX: Type inference for Nonce
+        let nonce = Nonce::from_slice(&nonce_bytes);
         self.cipher.encrypt(nonce, plaintext)
             .map(|ciphertext| (ciphertext, nonce_bytes))
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))
@@ -127,7 +126,7 @@ impl IrpCipher {
 
     /// Decrypts data with AES-256-GCM, requiring the original nonce.
     fn decrypt(&self, ciphertext: &[u8], nonce_bytes: &[u8; 12]) -> io::Result<Vec<u8>> {
-        let nonce = Nonce::from_slice(nonce_bytes); // FIX: Type inference for Nonce
+        let nonce = Nonce::from_slice(nonce_bytes);
         self.cipher.decrypt(nonce, ciphertext)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
     }
@@ -438,7 +437,7 @@ fn parse_ipv4_packet(packet_buf: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, Vec<u
 
 // --- OS Abstraction Layer for Raw Sockets ---
 /// Defines the interface for raw socket operations, allowing different OS implementations.
-#[async_trait] // FIX: Added async_trait for dyn compatibility
+#[async_trait]
 trait RawSocketTrait: Send + Sync {
     /// Creates a new raw socket bound to the local IP.
     fn new(local_ip: IpAddr) -> io::Result<Self> where Self: Sized;
@@ -459,7 +458,7 @@ struct LinuxRawSocket {
     local_ip_addr: IpAddr,
 }
 
-#[async_trait] // FIX: Added async_trait for dyn compatibility
+#[async_trait]
 impl RawSocketTrait for LinuxRawSocket {
     #[cfg(target_os = "linux")]
     fn new(local_ip: IpAddr) -> io::Result<Self> {
@@ -480,17 +479,13 @@ impl RawSocketTrait for LinuxRawSocket {
 
     #[cfg(not(target_os = "linux"))]
     fn new(_local_ip: IpAddr) -> io::Result<Self> {
-        // Placeholder for other OSes.
-        // On Windows, you'd use `WSASocket` with `IPPROTO_IP` and `SIO_HDRINCL`.
-        // On macOS/BSD, similar raw socket calls are needed.
-        // This requires platform-specific FFI (Foreign Function Interface) or crates.
         error!("Raw sockets are not implemented for non-Linux OS without platform-specific FFI.");
         Err(io::Error::new(io::ErrorKind::Unsupported, "Raw sockets not supported on this OS."))
     }
 
     async fn send_raw_packet(&self, remote_ip: IpAddr, raw_packet: &[u8]) -> io::Result<usize> {
         let socket_clone = self.socket.try_clone()?;
-        let packet_vec = raw_packet.to_vec(); // Copy for spawn_blocking
+        let packet_vec = raw_packet.to_vec();
         tokio::task::spawn_blocking(move || {
             socket_clone.send_to(&packet_vec, SocketAddr::new(remote_ip, 0))
         }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Spawn blocking send error: {}", e)))?
@@ -498,18 +493,18 @@ impl RawSocketTrait for LinuxRawSocket {
 
     async fn recv_raw_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let socket_clone = self.socket.try_clone()?;
-        let mut local_buf = vec![0u8; buf.len()]; // FIX: Create a local buffer to avoid raw pointer Send issues
-        let result = tokio::task::spawn_blocking(move || {
-            socket_clone.recv_from(&mut local_buf)
-        }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Spawn blocking recv error: {}", e)))?;
+        let buf_len = buf.len();
 
-        match result {
-            Ok((n, addr)) => {
-                buf[..n].copy_from_slice(&local_buf[..n]); // FIX: Copy data back to original buffer
-                Ok((n, addr))
+        let (n, addr, filled_data) = tokio::task::spawn_blocking(move || {
+            let mut local_buf = vec![0u8; buf_len]; // Create local_buf inside the closure
+            match socket_clone.recv_from(&mut local_buf) {
+                Ok((n, addr)) => Ok((n, addr, local_buf)), // Return filled buffer
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        }
+        }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Spawn blocking recv error: {}", e)))??; // Double ?? for Result<Result<T,E>,E>
+
+        buf[..n].copy_from_slice(&filled_data[..n]); // Copy data back after await
+        Ok((n, addr))
     }
 
     fn local_ip(&self) -> IpAddr {
@@ -520,7 +515,7 @@ impl RawSocketTrait for LinuxRawSocket {
 /// A wrapper that uses the appropriate RawSocketTrait implementation based on target OS.
 /// This is the type that higher-level modules will interact with.
 struct PlatformRawSocket {
-    inner: Box<dyn RawSocketTrait + Send + Sync>, // FIX: Added Send + Sync bounds for dyn trait
+    inner: Box<dyn RawSocketTrait + Send + Sync>,
 }
 
 impl PlatformRawSocket {
@@ -531,9 +526,6 @@ impl PlatformRawSocket {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            // For other OSes, you would need to implement their specific raw socket logic
-            // (e.g., WindowsRawSocket, MacRawSocket) and instantiate them here.
-            // For truly exotic OSes, this would involve FFI to C/C++ shims.
             error!("PlatformRawSocket not implemented for this OS. Current target: {}", std::env::consts::OS);
             Err(io::Error::new(io::ErrorKind::Unsupported, "Raw sockets not supported on this OS."))
         }
@@ -643,7 +635,7 @@ impl CovertTunnelStream {
         // Use the platform-agnostic raw socket
         let raw_socket = Arc::new(PlatformRawSocket::new(local_ip)?);
         let (data_to_read_tx, data_to_read_rx) = mpsc::channel(1024);
-        let (control_tx, mut control_rx) = mpsc::channel(16);
+        let (control_tx, _control_rx) = mpsc::channel(16); // FIX: _control_rx to avoid unused variable warning
         let (status_tx, status_rx) = mpsc::channel(1); // For sending state updates to main tasks
 
         let stream = CovertTunnelStream {
@@ -664,7 +656,6 @@ impl CovertTunnelStream {
             send_buffer: Arc::new(Mutex::new(HashMap::new())),
             recv_buffer: Arc::new(Mutex::new(HashMap::new())),
             connection_state: Arc::new(Mutex::new(ConnectionState::Closed)),
-            // Removed: retransmission_count, rtt_samples
             irp_obfuscation_min_padding,
             irp_obfuscation_max_padding,
             data_to_read_tx,
@@ -689,29 +680,25 @@ impl CovertTunnelStream {
         let recv_buffer_clone = stream.recv_buffer.clone();
         let data_to_read_tx_clone = stream.data_to_read_tx.clone();
         let connection_state_clone = stream.connection_state.clone();
-        // Removed: retransmission_count_clone, rtt_samples_clone
         let current_rto_ms_clone = stream.current_rto_ms.clone();
-        let initial_rto_ms_val = initial_rto_ms;
-        let max_rto_ms_val = max_rto_ms;
-        let status_tx_clone = stream.status_tx.clone(); // Clone for background task to send status
+        let _initial_rto_ms_val = initial_rto_ms; // FIX: Prefix with _
+        let _max_rto_ms_val = max_rto_ms; // FIX: Prefix with _
+        let status_tx_clone = stream.status_tx.clone();
+        let mut control_rx = stream.control_tx.subscribe(); // FIX: Use subscribe for broadcast channel
 
-        tokio::spawn(async move -> Result<(), io::Error> { // FIX: Make spawned task return Result
-            // Allocate receive buffer once to minimize allocations
+        tokio::spawn(async move -> Result<(), io::Error> {
             let mut recv_buf: Vec<u8> = vec![0; MAX_IP_PAYLOAD_SIZE + IPV4_HEADER_SIZE + ICMP_HEADER_SIZE];
-            let mut retransmit_interval = tokio::time::interval(Duration::from_millis(10)); // Frequent checks
-            let mut keep_alive_interval = tokio::time::interval(Duration::from_secs(5)); // Send keep-alives every 5s
+            let mut retransmit_interval = tokio::time::interval(Duration::from_millis(10));
+            let mut keep_alive_interval = tokio::time::interval(Duration::from_secs(5));
 
             loop {
-                // Adjust retransmit_interval based on current RTO
-                let current_rto = *current_rto_ms_clone.lock().unwrap();
-                retransmit_interval.tick().await; // Wait for the next tick
+                let current_rto = *current_rto_ms_clone.lock().await; // FIX: .lock().await
+                retransmit_interval.tick().await;
 
                 tokio::select! {
-                    // Receive raw packets
                     recv_result = socket_clone.recv_raw_packet(&mut recv_buf) => {
                         match recv_result {
                             Ok((n, src_addr)) => {
-                                // Resource management: Ensure we don't process garbage data
                                 if n == 0 || n > recv_buf.len() {
                                     warn!("Received empty or oversized packet ({} bytes). Dropping.", n);
                                     continue;
@@ -723,7 +710,6 @@ impl CovertTunnelStream {
                                         if proto == protocol_type_clone {
                                             match IrpPacket::from_bytes(&payload_bytes) {
                                                 Ok(irp_packet) => {
-                                                    // Resource management: Basic sanity check on payload length
                                                     if irp_packet.header.data_len as usize > irp_packet.encrypted_payload.len() {
                                                         warn!("Malformed packet: declared data_len {} but payload is {} for tunnel {:?}",
                                                               irp_packet.header.data_len, irp_packet.encrypted_payload.len(), irp_packet.header.tunnel_id);
@@ -735,76 +721,69 @@ impl CovertTunnelStream {
                                                                protocol_type_clone, irp_packet.header.flags, irp_packet.header.sequence_num,
                                                                irp_packet.header.ack_num, src_addr.ip());
 
-                                                        let mut current_state = connection_state_clone.lock().unwrap();
+                                                        let mut current_state = connection_state_clone.lock().await; // FIX: .lock().await
 
-                                                        // Handle RST flag immediately
                                                         if irp_packet.header.flags.rst {
                                                             info!("Received RST for tunnel ID: {:?}. Aborting connection.", tunnel_id_clone);
                                                             *current_state = ConnectionState::Closed;
-                                                            data_to_read_tx_clone.send(Vec::new()).await.ok(); // Signal close
+                                                            data_to_read_tx_clone.send(Vec::new()).await.ok();
                                                             status_tx_clone.send(ConnectionState::Closed).await.ok();
-                                                            break; // Exit loop
+                                                            break;
                                                         }
 
-                                                        // Process ACKs first to clear send buffer
                                                         if irp_packet.header.flags.ack {
                                                             let ack_num = irp_packet.header.ack_num;
-                                                            let mut send_buffer = send_buffer_clone.lock().unwrap();
-                                                            // Resource management: Use retain for in-place removal
-                                                            send_buffer.retain(|&seq, (_, _, _)| { // FIX: Removed unused variables
-                                                                seq >= ack_num // Keep packets with seq >= ack_num
+                                                            let mut send_buffer = send_buffer_clone.lock().await; // FIX: .lock().await
+                                                            send_buffer.retain(|&seq, (_, _, _)| {
+                                                                seq >= ack_num
                                                             });
-                                                            *last_acked_seq_clone.lock().unwrap() = ack_num;
+                                                            *last_acked_seq_clone.lock().await = ack_num; // FIX: .lock().await
                                                             debug!("ACK received for seq up to {}. Send buffer size: {}", ack_num, send_buffer.len());
 
-                                                            // Congestion control: AIMD (Additive Increase) - simplified
-                                                            let mut send_window = send_window_size_clone.lock().unwrap();
-                                                            *send_window = send_window.saturating_add(1); // Increase window size
+                                                            let mut send_window = send_window_size_clone.lock().await; // FIX: .lock().await
+                                                            *send_window = send_window.saturating_add(1);
                                                             debug!("Send window increased to {}", *send_window);
                                                         }
 
-                                                        // Handle SYN
                                                         if irp_packet.header.flags.syn {
                                                             match *current_state {
                                                                 ConnectionState::Closed => {
                                                                     info!("Server received SYN from client for tunnel ID: {:?}", tunnel_id_clone);
-                                                                    *next_recv_seq_clone.lock().unwrap() = irp_packet.header.sequence_num + 1; // Set initial sequence
+                                                                    *next_recv_seq_clone.lock().await = irp_packet.header.sequence_num + 1; // FIX: .lock().await
                                                                     *current_state = ConnectionState::SynReceived;
-                                                                    // Send SYN-ACK
                                                                     let mut flags = IrpFlags::new();
                                                                     flags.syn = true;
                                                                     flags.ack = true;
                                                                     let (encrypted_payload, nonce) = cipher_clone.encrypt(&[]).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
                                                                     let syn_ack_packet = IrpPacket::new(
                                                                         tunnel_id_clone,
-                                                                        *next_send_seq_clone.lock().unwrap(), // Server's initial sequence
-                                                                        *next_recv_seq_clone.lock().unwrap(), // Acknowledge client's SYN
+                                                                        *next_send_seq_clone.lock().await, // FIX: .lock().await
+                                                                        *next_recv_seq_clone.lock().await, // FIX: .lock().await
                                                                         flags,
                                                                         nonce,
-                                                                        Vec::new(), // No padding for control packets
+                                                                        Vec::new(),
                                                                         encrypted_payload,
                                                                     );
                                                                     if let Err(e) = CovertTunnelStream::send_irp_packet(&socket_clone, remote_ip_clone, protocol_type_clone, &syn_ack_packet).await {
                                                                         error!("Failed to send SYN-ACK: {}", e);
                                                                     }
-                                                                    *next_send_seq_clone.lock().unwrap() += 1;
+                                                                    *next_send_seq_clone.lock().await += 1; // FIX: .lock().await
                                                                 },
                                                                 ConnectionState::SynSent => {
                                                                     info!("Client received SYN-ACK from server for tunnel ID: {:?}", tunnel_id_clone);
-                                                                    *next_recv_seq_clone.lock().unwrap() = irp_packet.header.sequence_num + 1; // Set initial sequence
+                                                                    *next_recv_seq_clone.lock().await = irp_packet.header.sequence_num + 1; // FIX: .lock().await
                                                                     *current_state = ConnectionState::Established;
-                                                                    status_tx_clone.send(ConnectionState::Established).await.ok(); // Notify main task
-                                                                    // Send final ACK for handshake
+                                                                    status_tx_clone.send(ConnectionState::Established).await.ok();
                                                                     let mut flags = IrpFlags::new();
                                                                     flags.ack = true;
                                                                     let (encrypted_payload, nonce) = cipher_clone.encrypt(&[]).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
                                                                     let ack_packet = IrpPacket::new(
                                                                         tunnel_id_clone,
-                                                                        *next_send_seq_clone.lock().unwrap(), // Client's next sequence (after SYN)
-                                                                        *next_recv_seq_clone.lock().unwrap(), // Acknowledge server's SYN-ACK
+                                                                        *next_send_seq_clone.lock().await, // FIX: .lock().await
+                                                                        *next_recv_seq_clone.lock().await, // FIX: .lock().await
                                                                         flags,
                                                                         nonce,
-                                                                        Vec::new(), // No padding for control packets
+                                                                        Vec::new(),
                                                                         encrypted_payload,
                                                                     );
                                                                     if let Err(e) = CovertTunnelStream::send_irp_packet(&socket_clone, remote_ip_clone, protocol_type_clone, &ack_packet).await {
@@ -815,18 +794,15 @@ impl CovertTunnelStream {
                                                             }
                                                         }
 
-                                                        // Process Data packets (PSH flag)
                                                         if irp_packet.header.flags.psh {
-                                                            let mut next_recv_seq = next_recv_seq_clone.lock().unwrap();
+                                                            let mut next_recv_seq = next_recv_seq_clone.lock().await; // FIX: .lock().await
                                                             if irp_packet.header.sequence_num == *next_recv_seq {
-                                                                // In-order packet, decrypt and send to reader
                                                                 let decrypted_payload = cipher_clone.decrypt(&irp_packet.encrypted_payload, &irp_packet.header.nonce)?;
                                                                 if let Err(e) = data_to_read_tx_clone.send(decrypted_payload).await {
                                                                     error!("Failed to send received data to channel: {}", e);
                                                                 }
                                                                 *next_recv_seq += 1;
-                                                                // Process buffered out-of-order packets
-                                                                let mut recv_buffer = recv_buffer_clone.lock().unwrap();
+                                                                let mut recv_buffer = recv_buffer_clone.lock().await; // FIX: .lock().await
                                                                 while let Some(buffered_packet) = recv_buffer.remove(&*next_recv_seq) {
                                                                     let decrypted_payload = cipher_clone.decrypt(&buffered_packet.encrypted_payload, &buffered_packet.header.nonce)?;
                                                                     if let Err(e) = data_to_read_tx_clone.send(decrypted_payload).await {
@@ -835,10 +811,9 @@ impl CovertTunnelStream {
                                                                     *next_recv_seq += 1;
                                                                 }
                                                             } else if irp_packet.header.sequence_num > *next_recv_seq {
-                                                                // Out-of-order packet, buffer it if within receive window
-                                                                let recv_window_size = *recv_window_size_clone.lock().unwrap();
+                                                                let recv_window_size = *recv_window_size_clone.lock().await; // FIX: .lock().await
                                                                 if irp_packet.header.sequence_num < *next_recv_seq + recv_window_size {
-                                                                    let mut recv_buffer = recv_buffer_clone.lock().unwrap();
+                                                                    let mut recv_buffer = recv_buffer_clone.lock().await; // FIX: .lock().await
                                                                     recv_buffer.insert(irp_packet.header.sequence_num, irp_packet.clone());
                                                                     debug!("Buffered out-of-order packet: {}", irp_packet.header.sequence_num);
                                                                 } else {
@@ -846,17 +821,16 @@ impl CovertTunnelStream {
                                                                           irp_packet.header.sequence_num, *next_recv_seq, recv_window_size);
                                                                 }
                                                             }
-                                                            // Send ACK for the highest in-order sequence received
                                                             let mut flags = IrpFlags::new();
                                                             flags.ack = true;
                                                             let (encrypted_payload, nonce) = cipher_clone.encrypt(&[]).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
                                                             let ack_packet = IrpPacket::new(
                                                                 tunnel_id_clone,
-                                                                0, // Sequence number not relevant for ACK
-                                                                *next_recv_seq, // Acknowledging next expected sequence
+                                                                0,
+                                                                *next_recv_seq,
                                                                 flags,
                                                                 nonce,
-                                                                Vec::new(), // No padding for control packets
+                                                                Vec::new(),
                                                                 encrypted_payload,
                                                             );
                                                             if let Err(e) = CovertTunnelStream::send_irp_packet(&socket_clone, remote_ip_clone, protocol_type_clone, &ack_packet).await {
@@ -864,13 +838,11 @@ impl CovertTunnelStream {
                                                             }
                                                         }
 
-                                                        // Handle FIN
                                                         if irp_packet.header.flags.fin {
                                                             info!("Received FIN for tunnel ID: {:?}. State: {:?}", tunnel_id_clone, *current_state);
                                                             match *current_state {
                                                                 ConnectionState::Established | ConnectionState::SynReceived => {
-                                                                    *current_state = ConnectionState::CloseWait; // Server side
-                                                                    // Send FIN-ACK
+                                                                    *current_state = ConnectionState::CloseWait;
                                                                     let mut flags = IrpFlags::new();
                                                                     flags.fin = true;
                                                                     flags.ack = true;
@@ -881,12 +853,10 @@ impl CovertTunnelStream {
                                                                     if let Err(e) = CovertTunnelStream::send_irp_packet(&socket_clone, remote_ip_clone, protocol_type_clone, &fin_ack_packet).await {
                                                                         error!("Failed to send FIN-ACK: {}", e);
                                                                     }
-                                                                    data_to_read_tx_clone.send(Vec::new()).await.ok(); // Signal TCP proxy to stop reading
+                                                                    data_to_read_tx_clone.send(Vec::new()).await.ok();
                                                                 },
                                                                 ConnectionState::FinWait1 => {
-                                                                    // Concurrent close: Received FIN while in FIN_WAIT1
-                                                                    *current_state = ConnectionState::Closing; // Not a standard TCP state, but useful
-                                                                    // Send FIN-ACK
+                                                                    *current_state = ConnectionState::Closing;
                                                                     let mut flags = IrpFlags::new();
                                                                     flags.fin = true;
                                                                     flags.ack = true;
@@ -897,17 +867,15 @@ impl CovertTunnelStream {
                                                                     if let Err(e) = CovertTunnelStream::send_irp_packet(&socket_clone, remote_ip_clone, protocol_type_clone, &fin_ack_packet).await {
                                                                         error!("Failed to send FIN-ACK: {}", e);
                                                                     }
-                                                                    // Transition to TIME_WAIT after sending FIN-ACK
                                                                     *current_state = ConnectionState::TimeWait;
-                                                                    tokio::time::sleep(Duration::from_secs(2)).await; // 2MSL equivalent
+                                                                    tokio::time::sleep(Duration::from_secs(2)).await;
                                                                     *current_state = ConnectionState::Closed;
                                                                     status_tx_clone.send(ConnectionState::Closed).await.ok();
                                                                     break;
                                                                 },
                                                                 ConnectionState::FinWait2 => {
-                                                                    // Received FIN-ACK for our FIN, now received FIN from other side
                                                                     *current_state = ConnectionState::TimeWait;
-                                                                    tokio::time::sleep(Duration::from_secs(2)).await; // 2MSL equivalent
+                                                                    tokio::time::sleep(Duration::from_secs(2)).await;
                                                                     *current_state = ConnectionState::Closed;
                                                                     status_tx_clone.send(ConnectionState::Closed).await.ok();
                                                                     break;
@@ -923,35 +891,32 @@ impl CovertTunnelStream {
                                     }
                                 }
                             },
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => { // FIX: Corrected error type inference
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 // No data yet, continue
                             },
                             Err(e) => {
                                 error!("Raw socket receive error: {}", e);
-                                *connection_state_clone.lock().unwrap() = ConnectionState::Closed;
+                                *connection_state_clone.lock().await = ConnectionState::Closed; // FIX: .lock().await
                                 data_to_read_tx_clone.send(Vec::new()).await.ok();
                                 status_tx_clone.send(ConnectionState::Closed).await.ok();
-                                return Err(e); // FIX: Return error to terminate task
+                                return Err(e);
                             },
                         }
                     },
                     _ = retransmit_interval.tick() => {
-                        // Retransmit unacknowledged packets
-                        let mut send_buffer = send_buffer_clone.lock().unwrap();
+                        let mut send_buffer = send_buffer_clone.lock().await; // FIX: .lock().await
                         let now = Instant::now();
-                        let current_rto = *current_rto_ms_clone.lock().unwrap();
-                        let mut packets_to_retransmit = Vec::with_capacity(send_buffer.len()); // Pre-allocate
+                        let current_rto = *current_rto_ms_clone.lock().await; // FIX: .lock().await
+                        let mut packets_to_retransmit = Vec::with_capacity(send_buffer.len());
 
                         for (&seq, (packet, last_sent_time, retransmit_count)) in send_buffer.iter_mut() {
                             if now.duration_since(*last_sent_time) > Duration::from_millis(current_rto) {
                                 packets_to_retransmit.push(packet.clone());
-                                *last_sent_time = now; // Update last_sent_time
+                                *last_sent_time = now;
                                 *retransmit_count += 1;
-                                // Removed: retransmission_count_clone increment (part of conceptual metrics)
 
-                                // Congestion control: Multiplicative Decrease on retransmission - simplified
-                                let mut send_window = send_window_size_clone.lock().unwrap();
-                                *send_window = (*send_window / 2).max(1); // Halve window, minimum 1
+                                let mut send_window = send_window_size_clone.lock().await; // FIX: .lock().await
+                                *send_window = (*send_window / 2).max(1);
                                 warn!("Retransmitting packet {} (count {}). Send window reduced to {}",
                                       seq, *retransmit_count, *send_window);
                             }
@@ -964,19 +929,18 @@ impl CovertTunnelStream {
                         }
                     },
                     _ = keep_alive_interval.tick() => {
-                        let current_state = *connection_state_clone.lock().unwrap();
+                        let current_state = *connection_state_clone.lock().await; // FIX: .lock().await
                         if current_state == ConnectionState::Established {
-                            // Send a small ACK packet as a keep-alive
                             let mut flags = IrpFlags::new();
                             flags.ack = true;
                             let (encrypted_payload, nonce) = cipher_clone.encrypt(&[]).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
                             let keep_alive_packet = IrpPacket::new(
                                 tunnel_id_clone,
-                                *next_send_seq_clone.lock().unwrap(),
-                                *next_recv_seq_clone.lock().unwrap(),
+                                *next_send_seq_clone.lock().await, // FIX: .lock().await
+                                *next_recv_seq_clone.lock().await, // FIX: .lock().await
                                 flags,
                                 nonce,
-                                Vec::new(), // No padding for control packets
+                                Vec::new(),
                                 encrypted_payload,
                             );
                             if let Err(e) = CovertTunnelStream::send_irp_packet(&socket_clone, remote_ip_clone, protocol_type_clone, &keep_alive_packet).await {
@@ -994,18 +958,18 @@ impl CovertTunnelStream {
                                 let (encrypted_payload, nonce) = cipher_clone.encrypt(&[]).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
                                 let fin_packet = IrpPacket::new(
                                     tunnel_id_clone,
-                                    *next_send_seq_clone.lock().unwrap(),
-                                    *next_recv_seq_clone.lock().unwrap(),
+                                    *next_send_seq_clone.lock().await, // FIX: .lock().await
+                                    *next_recv_seq_clone.lock().await, // FIX: .lock().await
                                     fin_flags,
                                     nonce,
-                                    Vec::new(), // No padding for control packets
+                                    Vec::new(),
                                     encrypted_payload,
                                 );
                                 if let Err(e) = CovertTunnelStream::send_irp_packet(&socket_clone, remote_ip_clone, protocol_type_clone, &fin_packet).await {
                                     error!("Failed to send FIN: {}", e);
                                 }
-                                *next_send_seq_clone.lock().unwrap() += 1;
-                                *connection_state_clone.lock().unwrap() = ConnectionState::FinWait1;
+                                *next_send_seq_clone.lock().await += 1; // FIX: .lock().await
+                                *connection_state_clone.lock().await = ConnectionState::FinWait1; // FIX: .lock().await
                             }
                             if flags.rst {
                                 info!("Sending RST for tunnel ID: {:?}. Aborting.", tunnel_id_clone);
@@ -1019,26 +983,24 @@ impl CovertTunnelStream {
                                 if let Err(e) = CovertTunnelStream::send_irp_packet(&socket_clone, remote_ip_clone, protocol_type_clone, &rst_packet).await {
                                     error!("Failed to send RST: {}", e);
                                 }
-                                *connection_state_clone.lock().unwrap() = ConnectionState::Closed;
+                                *connection_state_clone.lock().await = ConnectionState::Closed; // FIX: .lock().await
                                 status_tx_clone.send(ConnectionState::Closed).await.ok();
-                                return Ok(()); // FIX: Return Ok to terminate task
+                                return Ok(());
                             }
                         } else {
-                            // Control channel closed, means main tasks are done
                             info!("Control channel closed for tunnel {:?}. Exiting background task.", tunnel_id_clone);
-                            *connection_state_clone.lock().unwrap() = ConnectionState::Closed; // Ensure state is closed
+                            *connection_state_clone.lock().await = ConnectionState::Closed; // FIX: .lock().await
                             status_tx_clone.send(ConnectionState::Closed).await.ok();
-                            return Ok(()); // FIX: Return Ok to terminate task
+                            return Ok(());
                         }
                     }
                 }
-                // Check connection state for graceful shutdown
-                let current_state = *connection_state_clone.lock().unwrap();
+                let current_state = *connection_state_clone.lock().await; // FIX: .lock().await
                 if current_state == ConnectionState::Closed {
-                    break; // Exit loop if connection is closed
+                    break;
                 }
             }
-            Ok(()) // FIX: Ensure all paths return Ok(())
+            Ok(())
         });
 
         Ok(stream)
@@ -1053,7 +1015,6 @@ impl CovertTunnelStream {
     ) -> io::Result<()> {
         let irp_packet_bytes = irp_packet.to_bytes()?;
 
-        // Resource management: Check if packet size exceeds MTU
         if irp_packet_bytes.len() > MAX_IP_PAYLOAD_SIZE {
             error!("IRP packet too large: {} bytes. Max is {}", irp_packet_bytes.len(), MAX_IP_PAYLOAD_SIZE);
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "IRP packet too large"));
@@ -1082,10 +1043,8 @@ impl CovertTunnelStream {
         Ok(())
     }
 
-    // Public methods for reading/writing data to the tunnel
     async fn read_data(&mut self) -> io::Result<Vec<u8>> {
-        // Check connection state before reading
-        let current_state = *self.connection_state.lock().unwrap();
+        let current_state = *self.connection_state.lock().await; // FIX: .lock().await
         if !matches!(current_state, ConnectionState::Established | ConnectionState::FinWait2 | ConnectionState::CloseWait) {
             return Err(io::Error::new(io::ErrorKind::NotConnected, format!("Covert tunnel not established for reading. Current state: {:?}", current_state)));
         }
@@ -1095,8 +1054,7 @@ impl CovertTunnelStream {
     }
 
     async fn write_data(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Check connection state before writing
-        let current_state = *self.connection_state.lock().unwrap();
+        let current_state = *self.connection_state.lock().await; // FIX: .lock().await
         if current_state != ConnectionState::Established {
             return Err(io::Error::new(io::ErrorKind::NotConnected, format!("Covert tunnel not established for writing. Current state: {:?}", current_state)));
         }
@@ -1104,56 +1062,50 @@ impl CovertTunnelStream {
         let mut offset = 0;
         let cipher = self.cipher.clone();
         let next_send_seq = self.next_send_seq.clone();
-        let next_recv_seq = self.next_recv_seq.clone(); // For ACK in header
+        let next_recv_seq = self.next_recv_seq.clone();
         let send_buffer = self.send_buffer.clone();
         let socket = self.raw_socket.clone();
         let remote_ip = self.remote_ip;
         let protocol_type = self.protocol_type;
-        let send_window_size = *self.send_window_size.lock().unwrap();
-        let last_acked_seq = *self.last_acked_seq.lock().unwrap();
+        let send_window_size = *self.send_window_size.lock().await; // FIX: .lock().await
+        let last_acked_seq = *self.last_acked_seq.lock().await; // FIX: .lock().await
 
         while offset < buf.len() {
-            // Flow control: Wait if send window is full
-            while (next_send_seq.lock().unwrap().wrapping_sub(last_acked_seq)) >= send_window_size {
+            while (next_send_seq.lock().await.wrapping_sub(last_acked_seq)) >= send_window_size { // FIX: .lock().await
                 debug!("Send window full. Waiting for ACKs. Next send: {}, Last ACKed: {}, Window: {}",
-                       *next_send_seq.lock().unwrap(), last_acked_seq, send_window_size);
-                tokio::time::sleep(Duration::from_millis(50)).await; // Wait and recheck
-                // Refresh last_acked_seq, as it might have been updated by background task
-                let updated_last_acked_seq = *self.last_acked_seq.lock().unwrap();
+                       *next_send_seq.lock().await, last_acked_seq, send_window_size); // FIX: .lock().await
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let updated_last_acked_seq = *self.last_acked_seq.lock().await; // FIX: .lock().await
                 if updated_last_acked_seq != last_acked_seq {
-                    // Window might have opened, re-evaluate
                     break;
                 }
             }
 
-            // Calculate max data payload size considering header and potential padding
             let max_data_payload_size = MAX_IP_PAYLOAD_SIZE - CUSTOM_IRFARP_HEADER_SIZE;
             let chunk_size = max_data_payload_size.min(buf.len() - offset);
             let chunk = &buf[offset..offset + chunk_size];
 
             let (encrypted_chunk, nonce) = cipher.encrypt(chunk)?;
 
-            // Generate random padding for IRP if protocol is IRP
             let mut padding = Vec::new();
             let mut flags = IrpFlags::new();
             if protocol_type == CovertProtocol::IRP.get_protocol_number() {
                 let padding_len = rand::thread_rng().gen_range(self.irp_obfuscation_min_padding..=self.irp_obfuscation_max_padding);
-                // Resource management: Pre-allocate padding vector
                 padding.reserve_exact(padding_len);
-                padding.extend_from_slice(&get_csprng_bytes::<{MAX_IP_PAYLOAD_SIZE}>()[..padding_len]); // Use CSPRNG for padding
+                padding.extend_from_slice(&get_csprng_bytes::<{MAX_IP_PAYLOAD_SIZE}>()[..padding_len]);
                 flags.pad = true;
             }
 
-            flags.psh = true; // Mark as push for immediate delivery
-            flags.ack = true; // Always send ACK with data for efficiency
+            flags.psh = true;
+            flags.ack = true;
 
             let current_seq = {
-                let mut s = next_send_seq.lock().unwrap();
+                let mut s = next_send_seq.lock().await; // FIX: .lock().await
                 let seq = *s;
                 *s += 1;
                 seq
             };
-            let current_ack = *next_recv_seq.lock().unwrap();
+            let current_ack = *next_recv_seq.lock().await; // FIX: .lock().await
 
             let packet = IrpPacket::new(
                 self.tunnel_id,
@@ -1164,14 +1116,13 @@ impl CovertTunnelStream {
                 padding,
                 encrypted_chunk,
             );
-            send_buffer.lock().unwrap().insert(current_seq, (packet.clone(), Instant::now(), 0)); // Store for retransmission
+            send_buffer.lock().await.insert(current_seq, (packet.clone(), Instant::now(), 0)); // FIX: .lock().await
             CovertTunnelStream::send_irp_packet(&socket, remote_ip, protocol_type, &packet).await?;
             offset += chunk_size;
         }
         Ok(buf.len())
     }
 
-    // Initiates graceful shutdown from the local side.
     async fn close(&mut self) -> io::Result<()> {
         info!("Initiating graceful tunnel shutdown for ID: {:?}", self.tunnel_id);
         let mut flags = IrpFlags::new();
@@ -1181,31 +1132,28 @@ impl CovertTunnelStream {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Failed to send FIN control message"));
         }
 
-        // Wait for connection to transition to Closed state (or timeout)
-        let mut status_rx = self.status_rx.clone();
-        tokio::time::timeout(Duration::from_secs(15), status_rx.recv()) // Wait up to 15 seconds for close confirmation
+        let status_rx = &mut self.status_rx; // FIX: Use reference to status_rx
+        tokio::time::timeout(Duration::from_secs(15), status_rx.recv())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Tunnel close timeout"))?
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Status channel closed unexpectedly"))?;
 
-        let final_state = *self.connection_state.lock().unwrap();
+        let final_state = *self.connection_state.lock().await; // FIX: .lock().await
         if final_state == ConnectionState::Closed {
             info!("Tunnel ID {:?} gracefully closed.", self.tunnel_id);
             Ok(())
         } else {
             error!("Tunnel ID {:?} did not close gracefully. Final state: {:?}", self.tunnel_id, final_state);
-            // Send RST if graceful close fails
             let mut rst_flags = IrpFlags::new();
             rst_flags.rst = true;
             if let Err(e) = self.control_tx.send(rst_flags).await {
                 error!("Failed to send RST control message during forced close: {}", e);
             }
-            *self.connection_state.lock().unwrap() = ConnectionState::Closed;
+            *self.connection_state.lock().await = ConnectionState::Closed; // FIX: .lock().await
             Err(io::Error::new(io::ErrorKind::TimedOut, "Tunnel close failed or timed out"))
         }
     }
 
-    // Abruptly terminates the tunnel.
     async fn reset(&mut self) -> io::Result<()> {
         info!("Initiating abrupt tunnel reset for ID: {:?}", self.tunnel_id);
         let mut flags = IrpFlags::new();
@@ -1214,17 +1162,13 @@ impl CovertTunnelStream {
             error!("Failed to send RST control message: {}", e);
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Failed to send RST control message"));
         }
-        // No need to wait for state, RST is immediate
-        *self.connection_state.lock().unwrap() = ConnectionState::Closed;
+        *self.connection_state.lock().await = ConnectionState::Closed; // FIX: .lock().await
         Ok(())
     }
 
-    // Get current connection state
     fn get_state(&self) -> ConnectionState {
-        *self.connection_state.lock().unwrap()
+        *self.connection_state.blocking_lock() // FIX: Use blocking_lock for non-async context
     }
-
-    // Removed: get_packet_loss_rate, get_average_rtt_ms
 }
 
 // --- IRFARP Server Implementation ---
@@ -1232,9 +1176,9 @@ impl CovertTunnelStream {
 struct IrfarpServer {
     config: ServerConfig,
     metrics_sender: mpsc::Sender<ConnectionMetrics>,
-    active_tunnels: Arc<Mutex<HashMap<[u8; TUNNEL_ID_SIZE], tokio::net::TcpStream>>>,
+    active_tunnels: Arc<Mutex<HashMap<[u8; TUNNEL_ID_SIZE], Arc<tokio::net::TcpStream>>>>, // FIX: Arc<Mutex<Arc<TcpStream>>>
     covert_data_tx_map: Arc<Mutex<HashMap<[u8; TUNNEL_ID_SIZE], mpsc::Sender<Vec<u8>>>>>,
-    session_cipher_map: Arc<Mutex<HashMap<[u8; TUNNEL_ID_SIZE], Arc<IrpCipher>>>>, // Store ciphers per tunnel
+    session_cipher_map: Arc<Mutex<HashMap<[u8; TUNNEL_ID_SIZE], Arc<IrpCipher>>>>,
 }
 
 impl IrfarpServer {
@@ -1267,10 +1211,9 @@ impl IrfarpServer {
             io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid IRP bind IP: {}", e))
         })?;
 
-        // Use PlatformRawSocket for all listeners
         let icmp_raw_socket = Arc::new(PlatformRawSocket::new(icmp_bind_ip)?);
         let custom_ip_raw_socket = Arc::new(PlatformRawSocket::new(custom_ip_bind_ip)?);
-        let irp_raw_socket = Arc::new(PlatformRawSocket::new(irp_bind_ip)?); // New raw socket for IRP
+        let irp_raw_socket = Arc::new(PlatformRawSocket::new(irp_bind_ip)?);
 
         let services_map: Arc<HashMap<String, ServiceConfig>> = Arc::new(self.config.services.clone());
         let metrics_sender = self.metrics_sender.clone();
@@ -1278,14 +1221,12 @@ impl IrfarpServer {
         let covert_data_tx_map_clone = self.covert_data_tx_map.clone();
         let session_cipher_map_clone = self.session_cipher_map.clone();
 
-        // Decode the master authentication key from base64
-        let master_auth_key: Arc<[u8; 32]> = Arc::new(general_purpose::STANDARD.decode(&self.config.auth_key_base64) // FIX: Explicit type for Arc
+        let master_auth_key: Arc<[u8; 32]> = Arc::new(general_purpose::STANDARD.decode(&self.config.auth_key_base64)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to decode auth_key_base64: {}", e)))?
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "auth_key_base64 must decode to a 32-byte key"))?);
 
 
-        // Spawn ICMP Listener Task
         let icmp_listener_task = IrfarpServer::spawn_raw_protocol_listener(
             icmp_raw_socket.clone(),
             CovertProtocol::ICMP.get_protocol_number(),
@@ -1297,7 +1238,6 @@ impl IrfarpServer {
             master_auth_key.clone(),
         );
 
-        // Spawn Custom IP Listener Task
         let custom_ip_listener_task = IrfarpServer::spawn_raw_protocol_listener(
             custom_ip_raw_socket.clone(),
             CovertProtocol::CustomIP(253).get_protocol_number(),
@@ -1309,10 +1249,9 @@ impl IrfarpServer {
             master_auth_key.clone(),
         );
 
-        // Spawn IRP Listener Task
         let irp_listener_task = IrfarpServer::spawn_raw_protocol_listener(
             irp_raw_socket.clone(),
-            CovertProtocol::IRP.get_protocol_number(), // IRP protocol number 254
+            CovertProtocol::IRP.get_protocol_number(),
             services_map.clone(),
             metrics_sender.clone(),
             active_tunnels_clone.clone(),
@@ -1321,31 +1260,27 @@ impl IrfarpServer {
             master_auth_key.clone(),
         );
 
-        // Keep server alive, listening on raw sockets
         tokio::join!(icmp_listener_task, custom_ip_listener_task, irp_listener_task);
 
         Ok(())
     }
 
-    // Generic raw protocol listener
     async fn spawn_raw_protocol_listener(
         raw_socket: Arc<PlatformRawSocket>,
         protocol_type: u8,
         services_map: Arc<HashMap<String, ServiceConfig>>,
         metrics_sender: mpsc::Sender<ConnectionMetrics>,
-        active_tunnels: Arc<Mutex<HashMap<[u8; TUNNEL_ID_SIZE], tokio::net::TcpStream>>>,
+        active_tunnels: Arc<Mutex<HashMap<[u8; TUNNEL_ID_SIZE], Arc<tokio::net::TcpStream>>>>, // FIX: Arc<Mutex<Arc<TcpStream>>>
         covert_data_tx_map: Arc<Mutex<HashMap<[u8; TUNNEL_ID_SIZE], mpsc::Sender<Vec<u8>>>>>,
         session_cipher_map: Arc<Mutex<HashMap<[u8; TUNNEL_ID_SIZE], Arc<IrpCipher>>>>,
         master_auth_key: Arc<[u8; 32]>,
     ) -> io::Result<()> {
         info!("IRFARP Server raw protocol listener for protocol {} bound to {}", protocol_type, raw_socket.local_ip());
 
-        // Resource management: Allocate receive buffer once
         let mut recv_buf: Vec<u8> = vec![0; MAX_IP_PAYLOAD_SIZE + IPV4_HEADER_SIZE + ICMP_HEADER_SIZE];
         loop {
             match raw_socket.recv_raw_packet(&mut recv_buf).await {
                 Ok((n, src_addr)) => {
-                    // Resource management: Basic sanity check on received data length
                     if n == 0 || n > recv_buf.len() {
                         warn!("Received empty or oversized packet ({} bytes). Dropping.", n);
                         continue;
@@ -1358,7 +1293,6 @@ impl IrfarpServer {
                         if proto == protocol_type {
                             match IrpPacket::from_bytes(&payload_bytes) {
                                 Ok(irp_packet) => {
-                                    // Resource management: Basic sanity check on declared vs actual payload length
                                     if irp_packet.header.data_len as usize > irp_packet.encrypted_payload.len() {
                                         warn!("Malformed packet: declared data_len {} but payload is {} for tunnel {:?}",
                                               irp_packet.header.data_len, irp_packet.encrypted_payload.len(), irp_packet.header.tunnel_id);
@@ -1371,41 +1305,34 @@ impl IrfarpServer {
                                     let ack_num = irp_packet.header.ack_num;
                                     let encrypted_payload = irp_packet.encrypted_payload;
                                     let nonce = irp_packet.header.nonce;
-                                    let _padding = irp_packet.padding; // Padding is received but discarded after parsing
+                                    let _padding = irp_packet.padding;
 
                                     trace!("Server received IRP packet (proto {}, flags {:?}, seq {}, ack {}) from {}",
                                            protocol_type, flags, sequence_num, ack_num, src_ip);
 
-                                    let mut covert_data_tx_map_lock = covert_data_tx_map.lock().unwrap();
-                                    let mut session_cipher_map_lock = session_cipher_map.lock().unwrap();
+                                    let mut covert_data_tx_map_lock = covert_data_tx_map.lock().await; // FIX: .lock().await
+                                    let mut session_cipher_map_lock = session_cipher_map.lock().await; // FIX: .lock().await
                                     let current_cipher = session_cipher_map_lock.get(&tunnel_id).cloned();
 
-                                    // Handle RST flag immediately
                                     if flags.rst {
                                         info!("Received RST for tunnel ID: {:?}. Aborting connection on server.", tunnel_id);
                                         covert_data_tx_map_lock.remove(&tunnel_id);
                                         session_cipher_map_lock.remove(&tunnel_id);
-                                        if let Some(tcp_stream) = active_tunnels.lock().unwrap().remove(&tunnel_id) {
-                                            tcp_stream.shutdown().await.ok(); // Attempt graceful TCP shutdown
+                                        if let Some(tcp_stream_arc) = active_tunnels.lock().await.remove(&tunnel_id) { // FIX: .lock().await
+                                            tcp_stream_arc.shutdown().await.ok(); // FIX: shutdown on Arc<TcpStream>
                                         }
-                                        continue; // Process next packet
+                                        continue;
                                     }
 
-                                    // Process ACKs first (for server's own send buffer, if implemented)
                                     if flags.ack {
-                                        // In a full implementation, server would update its send buffer based on ack_num
                                         debug!("Server received ACK for tunnel {:?} seq {} via protocol {}", tunnel_id, ack_num, protocol_type);
                                     }
 
-                                    // Process SYN/Data/FIN
                                     if flags.syn {
                                         info!("Received SYN for new tunnel ID: {:?} via protocol {}", tunnel_id, protocol_type);
-                                        // SYN packet payload contains client_id:auth_token and a client-generated ephemeral nonce
-                                        // The nonce is now part of the IrpHeader.
                                         let client_ephemeral_nonce: [u8; NONCE_SIZE] = nonce;
 
-                                        // Server derives session key using client's nonce as salt
-                                        let session_key_bytes = match derive_session_key(&master_auth_key[..], &client_ephemeral_nonce, b"irp-session-key") { // FIX: Pass &master_auth_key[..]
+                                        let session_key_bytes = match derive_session_key(&master_auth_key[..], &client_ephemeral_nonce, b"irp-session-key") {
                                             Ok(key) => Arc::new(key),
                                             Err(e) => {
                                                 error!("Failed to derive session key for client {}: {}", src_ip, e);
@@ -1435,24 +1362,20 @@ impl IrfarpServer {
                                                     Ok(tcp_stream) => {
                                                         let (tx, rx) = mpsc::channel(1024);
                                                         covert_data_tx_map_lock.insert(tunnel_id, tx);
-                                                        // FIX: Use try_clone() and handle error, or wrap in Arc<Mutex<TcpStream>>
-                                                        // For simplicity, we'll assume try_clone() succeeds or panic for now,
-                                                        // but in a real system, you'd handle this more robustly.
-                                                        let cloned_tcp_stream = tcp_stream.try_clone().expect("Failed to clone TcpStream");
-                                                        active_tunnels.lock().unwrap().insert(tunnel_id, cloned_tcp_stream);
-                                                        session_cipher_map_lock.insert(tunnel_id, server_session_cipher.clone()); // Store cipher for this tunnel
+                                                        let tcp_stream_arc = Arc::new(tcp_stream); // FIX: Wrap TcpStream in Arc
+                                                        active_tunnels.lock().await.insert(tunnel_id, tcp_stream_arc.clone()); // FIX: .lock().await and store Arc
+                                                        session_cipher_map_lock.insert(tunnel_id, server_session_cipher.clone());
 
                                                         let metrics_sender_clone = metrics_sender.clone();
                                                         let server_addr_str = raw_socket.local_ip().to_string();
                                                         let service_id_clone = service_config.client_service_id.clone();
                                                         let client_id_clone = client_id_str.clone();
-                                                        // Pass RTO values directly
-                                                        let initial_rto_ms_val = 200; // Fixed initial RTO for server-side
-                                                        let max_rto_ms_val = 2000;   // Fixed max RTO for server-side
+                                                        let initial_rto_ms_val = 200;
+                                                        let max_rto_ms_val = 2000;
 
                                                         tokio::spawn(IrfarpServer::handle_covert_tunnel_data(
                                                             tunnel_id,
-                                                            tcp_stream, // Original tcp_stream moved here
+                                                            tcp_stream_arc, // FIX: Pass the Arc<TcpStream>
                                                             raw_socket.clone(),
                                                             src_ip,
                                                             protocol_type,
@@ -1471,7 +1394,7 @@ impl IrfarpServer {
                                                         syn_ack_flags.ack = true;
                                                         let (encrypted_payload, nonce) = server_session_cipher.encrypt(&[]).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
                                                         let syn_ack_packet = IrpPacket::new(
-                                                            tunnel_id, 0, sequence_num + 1, syn_ack_flags, nonce, Vec::new(), encrypted_payload // ACK client's SYN
+                                                            tunnel_id, 0, sequence_num + 1, syn_ack_flags, nonce, Vec::new(), encrypted_payload
                                                         );
                                                         if let Err(e) = CovertTunnelStream::send_irp_packet(&raw_socket, src_ip, protocol_type, &syn_ack_packet).await {
                                                             error!("Failed to send SYN-ACK: {}", e);
@@ -1486,7 +1409,7 @@ impl IrfarpServer {
                                             warn!("Malformed SYN payload from {}: {}", src_ip, decrypted_auth_info);
                                         }
                                     }
-                                } else if flags.psh { // PSH flag indicates data
+                                } else if flags.psh {
                                     if let Some(tx) = covert_data_tx_map_lock.get(&tunnel_id) {
                                         if let Some(cipher) = current_cipher {
                                             let decrypted_payload = match cipher.decrypt(&encrypted_payload, &nonce) {
@@ -1499,17 +1422,16 @@ impl IrfarpServer {
                                             if let Err(e) = tx.send(decrypted_payload).await {
                                                 error!("Failed to send received data to TCP proxy: {}", e);
                                             }
-                                            // Send ACK back to client for received data
                                             let mut ack_flags = IrpFlags::new();
                                             ack_flags.ack = true;
                                             let (encrypted_payload, nonce) = cipher.encrypt(&[]).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
                                             let ack_packet = IrpPacket::new(
                                                 tunnel_id,
-                                                0, // Sequence number not relevant for ACK
-                                                sequence_num + 1, // Acknowledge next expected sequence
+                                                0,
+                                                sequence_num + 1,
                                                 ack_flags,
                                                 nonce,
-                                                Vec::new(), // No padding for control packets
+                                                Vec::new(),
                                                 encrypted_payload,
                                             );
                                             if let Err(e) = CovertTunnelStream::send_irp_packet(&raw_socket, src_ip, protocol_type, &ack_packet).await {
@@ -1523,11 +1445,10 @@ impl IrfarpServer {
                                     }
                                 } else if flags.fin {
                                     info!("Received FIN for tunnel ID: {:?} via protocol {}", tunnel_id, protocol_type);
-                                    // Clean up tunnel resources
                                     covert_data_tx_map_lock.remove(&tunnel_id);
                                     session_cipher_map_lock.remove(&tunnel_id);
-                                    if let Some(tcp_stream) = active_tunnels.lock().unwrap().remove(&tunnel_id) {
-                                        tcp_stream.shutdown().await.ok(); // Attempt graceful TCP shutdown
+                                    if let Some(tcp_stream_arc) = active_tunnels.lock().await.remove(&tunnel_id) { // FIX: .lock().await
+                                        tcp_stream_arc.shutdown().await.ok(); // FIX: shutdown on Arc<TcpStream>
                                     }
                                     let mut fin_ack_flags = IrpFlags::new();
                                     fin_ack_flags.fin = true;
@@ -1535,7 +1456,7 @@ impl IrfarpServer {
                                     if let Some(cipher) = current_cipher {
                                         let (encrypted_payload, nonce) = cipher.encrypt(&[]).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
                                         let fin_ack_packet = IrpPacket::new(
-                                            tunnel_id, 0, sequence_num + 1, fin_ack_flags, nonce, Vec::new(), encrypted_payload // ACK client's FIN
+                                            tunnel_id, 0, sequence_num + 1, fin_ack_flags, nonce, Vec::new(), encrypted_payload
                                         );
                                         if let Err(e) = CovertTunnelStream::send_irp_packet(&raw_socket, src_ip, protocol_type, &fin_ack_packet).await {
                                             error!("Failed to send FIN-ACK: {}", e);
@@ -1544,96 +1465,90 @@ impl IrfarpServer {
                                         warn!("No cipher for FIN-ACK to unknown tunnel ID {:?}", tunnel_id);
                                     }
                                 } else {
-                                    debug!("Unhandled IRP packet type on server: {:?}", flags); // Should not happen with current flags
+                                    debug!("Unhandled IRP packet type on server: {:?}", flags);
                                 }
                             }
                         }
                     }
                 },
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // No data yet, continue
                 },
                 Err(e) => {
                     error!("Raw socket receive error for protocol {}: {}", protocol_type, e);
-                    return Err(e); // FIX: Return error to terminate task
+                    return Err(e);
                 },
             }
-            tokio::time::sleep(Duration::from_millis(1)).await; // Small delay to prevent busy-looping
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         Ok(())
     }
 
-    // Handles proxying data between the TCP stream (local service) and the CovertTunnelStream.
     async fn handle_covert_tunnel_data(
         tunnel_id: [u8; TUNNEL_ID_SIZE],
-        mut tcp_stream: tokio::net::TcpStream,
+        tcp_stream_arc: Arc<tokio::net::TcpStream>, // FIX: Changed to Arc<TcpStream>
         raw_socket: Arc<PlatformRawSocket>,
         client_ip: IpAddr,
         protocol_type: u8,
-        mut covert_data_rx: mpsc::Receiver<Vec<u8>>, // Receive data from raw listener
+        mut covert_data_rx: mpsc::Receiver<Vec<u8>>,
         metrics_sender: mpsc::Sender<ConnectionMetrics>,
         server_addr_str: String,
         service_id: String,
         client_id: String,
-        cipher: Arc<IrpCipher>, // Pass the session cipher
-        initial_rto_ms: u64, // Fixed initial RTO
-        max_rto_ms: u64,     // Fixed max RTO
+        cipher: Arc<IrpCipher>,
+        _initial_rto_ms: u64, // FIX: Prefix with _
+        _max_rto_ms: u64,     // FIX: Prefix with _
     ) -> io::Result<()> {
         let start_time = SystemTime::now();
-        let mut uploaded_bytes: u64 = 0; // Bytes from TCP service to client (downloaded by client)
-        let mut downloaded_bytes: u64 = 0; // Bytes from client to TCP service (uploaded by client)
+        let mut uploaded_bytes: u64 = 0;
+        let mut downloaded_bytes: u64 = 0;
 
-        let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
-
-        // Server-side tunnel next send sequence number (simplified, as client drives reliability)
-        let server_tunnel_next_send_seq = Arc::new(Mutex::new(0u32));
-        // Removed: server_tunnel_retransmissions, server_tunnel_rtt_samples
+        let (mut tcp_reader, mut tcp_writer) = tokio::io::split(tcp_stream_arc); // FIX: Split the Arc<TcpStream>
 
         let tcp_to_covert_task = async {
-            // Resource management: Allocate buffer once
             let mut buf: Vec<u8> = vec![0; MAX_IP_PAYLOAD_SIZE - CUSTOM_IRFARP_HEADER_SIZE];
             loop {
                 let n = tcp_reader.read(&mut buf).await?;
-                if n == 0 { break; } // EOF
+                if n == 0 { break; }
 
                 let (encrypted_data, nonce) = cipher.encrypt(&buf[..n])?;
 
                 let mut flags = IrpFlags::new();
-                flags.psh = true; // Push data immediately
-                flags.ack = true; // Always send ACK with data for efficiency
+                flags.psh = true;
+                flags.ack = true;
 
-                // No padding for server-to-client data for simplicity, can be added if needed
                 let packet = IrpPacket::new(
                     tunnel_id,
-                    *server_tunnel_next_send_seq.lock().unwrap(), // Server's sequence number (independent from client's)
-                    0, // Server's ACK number (simplified, client ACKs this)
+                    *server_tunnel_next_send_seq.lock().await, // FIX: .lock().await
+                    0,
                     flags,
                     nonce,
-                    Vec::new(), // No padding for server's data packets
+                    Vec::new(),
                     encrypted_data,
                 );
                 if let Err(e) = CovertTunnelStream::send_irp_packet(&raw_socket, client_ip, protocol_type, &packet).await {
                     error!("Server failed to send raw data to client: {}", e);
-                    return Err(e); // FIX: Return error to terminate task
+                    return Err(e);
                 }
-                *server_tunnel_next_send_seq.lock().unwrap() += 1;
+                *server_tunnel_next_send_seq.lock().await += 1; // FIX: .lock().await
                 uploaded_bytes += n as u64;
             }
-            Ok::<(), io::Error>(()) // FIX: Ensure all paths return Ok(())
+            Ok::<(), io::Error>(())
         };
+
+        let server_tunnel_next_send_seq = Arc::new(Mutex::new(0u32)); // FIX: Define here, it was missing
 
         let covert_to_tcp_task = async {
             loop {
                 match covert_data_rx.recv().await {
                     Some(decrypted_data) => {
-                        // Data is already decrypted by the listener
                         tcp_writer.write_all(&decrypted_data).await?;
                         downloaded_bytes += decrypted_data.len() as u64;
                     },
-                    None => break, // Channel closed
+                    None => break,
                 }
             }
-            Ok::<(), io::Error>(()) // FIX: Ensure all paths return Ok(())
+            Ok::<(), io::Error>(())
         };
 
         let result = tokio::select! {
@@ -1644,24 +1559,20 @@ impl IrfarpServer {
         let end_time = SystemTime::now();
         let duration = end_time.duration_since(start_time).unwrap_or_default().as_secs();
         let status = if result.is_ok() { "success" } else { "failure" };
-        let error_message = result.err().map(|e| e.to_string());
+        let error_message = result.as_ref().err().map(|e| e.to_string()); // FIX: Use as_ref()
 
-        // Send metrics
-        // These metrics are crucial for monitoring the performance and effectiveness
-        // of the covert communication, providing data for auditing and further optimization.
         let final_metrics = ConnectionMetrics {
-            timestamp_ms: end_time.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64, // FIX: Cast to u64
+            timestamp_ms: end_time.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
             client_id,
             service_id,
-            bytes_uploaded: uploaded_bytes, // FIX: Correct variable name
-            bytes_downloaded: downloaded_bytes, // FIX: Correct variable name
+            bytes_uploaded,
+            bytes_downloaded,
             duration_sec: duration,
             status: status.to_string(),
             error_message,
             peer_addr: client_ip.to_string(),
             server_addr: server_addr_str,
             protocol_used: format!("raw-{}", protocol_type),
-            // Removed: retransmissions, rtt_avg_ms, packet_loss_rate
         };
         if let Err(e) = metrics_sender.send(final_metrics).await {
             error!("Failed to send metrics: {}", e);
@@ -1677,7 +1588,6 @@ struct IrfarpClient {
     config: ClientConfig,
     metrics_sender: mpsc::Sender<ConnectionMetrics>,
     active_tunnels: Arc<Mutex<HashMap<String, Arc<Mutex<CovertTunnelStream>>>>>,
-    // Removed: protocol_health_manager
 }
 
 impl IrfarpClient {
@@ -1692,7 +1602,6 @@ impl IrfarpClient {
                 config,
                 metrics_sender,
                 active_tunnels: Arc::new(Mutex::new(HashMap::new())),
-                // Removed: protocol_health_manager
             },
             metrics_receiver,
         ))
@@ -1703,40 +1612,31 @@ impl IrfarpClient {
 
         let local_services = Arc::new(self.config.local_services.clone());
         let metrics_sender = self.metrics_sender.clone();
-        // Removed: adaptive_strategy
         let server_icmp_addr = self.config.server_icmp_addr.clone();
         let server_custom_ip_addr = self.config.server_custom_ip_addr.clone();
-        let server_irp_addr = self.config.server_irp_addr.clone(); // New IRP server address
+        let server_irp_addr = self.config.server_irp_addr.clone();
         let client_id_clone = self.config.client_id.clone();
         let auth_token_clone = self.config.auth_token.clone();
         let active_tunnels_clone = self.active_tunnels.clone();
-        let master_auth_key: Arc<[u8; 32]> = Arc::new(general_purpose::STANDARD.decode(&self.config.auth_key_base64) // FIX: Explicit type for Arc
+        let master_auth_key: Arc<[u8; 32]> = Arc::new(general_purpose::STANDARD.decode(&self.config.auth_key_base64)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to decode auth_key_base64: {}", e)))?
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "auth_key_base64 must decode to a 32-byte key"))?);
-        // Removed: protocol_health_manager_clone
 
-        // Removed: proactive health probing task
-
-        // Main loop for managing local service listeners
-        // This loop ensures that the client continuously listens for incoming TCP connections
-        // on the configured local service ports (e.g., for SSH or web proxy).
-        // For each new local connection, it attempts to establish a covert tunnel to the server.
         loop {
             for (service_id, local_service_config) in local_services.iter() {
-                // Check if a tunnel for this service already exists and is healthy
                 let tunnel_exists_and_healthy = {
-                    let active_tunnels_lock = active_tunnels_clone.lock().unwrap();
+                    let active_tunnels_lock = active_tunnels_clone.lock().await; // FIX: .lock().await
                     active_tunnels_lock.get(service_id)
                         .map_or(false, |tunnel_arc| {
-                            let tunnel = tunnel_arc.lock().unwrap();
+                            let tunnel = tunnel_arc.blocking_lock(); // FIX: blocking_lock for non-async context
                             tunnel.get_state() == ConnectionState::Established
                         })
                 };
 
                 if tunnel_exists_and_healthy {
                     debug!("Tunnel for service '{}' is already active and healthy. Skipping listener setup.", service_id);
-                    continue; // Skip setting up listener if tunnel is already active
+                    continue;
                 }
 
                 let local_listener = match tokio::net::TcpListener::bind(&local_service_config.local_addr).await {
@@ -1753,49 +1653,41 @@ impl IrfarpClient {
                 info!("Local connection for service '{}' from {}", service_id, local_peer_addr);
 
                 let metrics_sender_clone = metrics_sender.clone();
-                // Removed: adaptive_strategy_clone
                 let server_icmp_addr_clone = server_icmp_addr.clone();
                 let server_custom_ip_addr_clone = server_custom_ip_addr.clone();
                 let server_irp_addr_clone = server_irp_addr.clone();
                 let client_id_for_task = client_id_clone.clone();
                 let auth_token_for_task = auth_token_clone.clone();
-                let service_id_for_task = service_id.clone();
+                let service_id_for_task = service_id.clone(); // FIX: Clone service_id_for_task
                 let active_tunnels_for_task = active_tunnels_clone.clone();
                 let master_auth_key_for_task = master_auth_key.clone();
-                // Removed: protocol_health_manager_for_task
 
                 tokio::spawn(async move {
                     if let Err(e) = IrfarpClient::handle_local_connection(
                         local_stream,
                         local_peer_addr,
                         metrics_sender_clone,
-                        // Removed adaptive_strategy_clone
                         server_icmp_addr_clone,
                         server_custom_ip_addr_clone,
                         server_irp_addr_clone,
                         client_id_for_task,
                         auth_token_for_task,
-                        service_id_for_task,
+                        service_id_for_task.clone(), // FIX: Clone here for the error message
                         active_tunnels_for_task,
                         master_auth_key_for_task,
-                        // Removed protocol_health_manager_for_task
                     ).await {
                         error!("Error handling local connection for service {}: {}", service_id_for_task, e);
                     }
                 });
             }
-            tokio::time::sleep(Duration::from_secs(1)).await; // Prevent busy loop
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
-    // Handles a new local TCP connection, attempting to establish a covert tunnel
-    // and then proxying data between the local TCP stream and the covert tunnel.
-    // This function implements the adaptive protocol selection and self-healing logic.
     async fn handle_local_connection(
         mut local_stream: tokio::net::TcpStream,
         local_peer_addr: SocketAddr,
         metrics_sender: mpsc::Sender<ConnectionMetrics>,
-        // Removed adaptive_strategy parameter
         server_icmp_addr_str: String,
         server_custom_ip_addr_str: String,
         server_irp_addr_str: String,
@@ -1804,20 +1696,18 @@ impl IrfarpClient {
         service_id: String,
         active_tunnels: Arc<Mutex<HashMap<String, Arc<Mutex<CovertTunnelStream>>>>>,
         master_auth_key: Arc<[u8; 32]>,
-        // Removed protocol_health_manager parameter
     ) -> io::Result<()> {
         let mut attempts = 0;
-        let max_attempts = 20; // Fixed max retries
+        let max_attempts = 20;
 
         let local_ip: IpAddr = local_stream.local_addr()?.ip();
 
         let mut tunnel_stream: Option<Arc<Mutex<CovertTunnelStream>>> = None;
         let mut protocol_used_str = String::new();
         let mut final_remote_ip_str = String::new();
-        let mut final_protocol_type_u8 = 0;
+        let mut _final_protocol_type_u8 = 0; // FIX: Prefix with _
 
-        // Get protocol pool from client config
-        let client_config = load_config::<ClientConfig>("client_config_example.json")?; // Re-load config to get protocol_pool
+        let client_config = load_config::<ClientConfig>("client_config_example.json")?;
         let protocol_pool = client_config.protocol_pool.clone();
         let connect_timeout_ms = client_config.connect_timeout_ms;
         let retry_delay_ms = client_config.retry_delay_ms;
@@ -1827,13 +1717,10 @@ impl IrfarpClient {
         let irp_obfuscation_max_padding = client_config.irp_obfuscation_max_padding;
 
 
-        // Loop for covert tunnel establishment (SYN/SYN-ACK)
-        // This loop attempts to establish a connection by cycling through configured protocols.
         while attempts < max_attempts {
             attempts += 1;
             debug!("Attempt {}/{} to establish covert tunnel for service {}", attempts, max_attempts, service_id);
 
-            // Simple round-robin protocol selection
             let index = (attempts as usize - 1) % protocol_pool.len();
             let current_protocol_choice = protocol_pool[index].clone();
 
@@ -1846,18 +1733,17 @@ impl IrfarpClient {
             let protocol_type_u8 = current_protocol_choice.get_protocol_number();
             protocol_used_str = current_protocol_choice.to_string();
             final_remote_ip_str = remote_ip_str_choice.clone();
-            final_protocol_type_u8 = protocol_type_u8;
+            _final_protocol_type_u8 = protocol_type_u8; // FIX: Assign to _final_protocol_type_u8
 
             let remote_ip: IpAddr = remote_ip_str_choice.parse().map_err(|e| {
                 error!("Invalid server IP for protocol {}: {}", protocol_used_str, e);
                 io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid server IP: {}", e))
             })?;
 
-            let tunnel_id: [u8; TUNNEL_ID_SIZE] = get_csprng_bytes(); // Unique ID for this tunnel instance
-            let client_ephemeral_nonce: [u8; NONCE_SIZE] = get_csprng_bytes(); // Ephemeral nonce for key derivation
+            let tunnel_id: [u8; TUNNEL_ID_SIZE] = get_csprng_bytes();
+            let client_ephemeral_nonce: [u8; NONCE_SIZE] = get_csprng_bytes();
 
-            // Derive session key for this tunnel
-            let session_key_bytes = match derive_session_key(&master_auth_key[..], &client_ephemeral_nonce, b"irp-session-key") { // FIX: Pass &master_auth_key[..]
+            let session_key_bytes = match derive_session_key(&master_auth_key[..], &client_ephemeral_nonce, b"irp-session-key") {
                 Ok(key) => Arc::new(key),
                 Err(e) => {
                     error!("Failed to derive session key for client {}: {}", client_id, e);
@@ -1866,26 +1752,24 @@ impl IrfarpClient {
             };
             let client_session_cipher = Arc::new(IrpCipher::new(&session_key_bytes));
 
-            // SYN packet payload: client_id:auth_token, encrypted with session cipher using ephemeral nonce
             let syn_payload_plaintext = format!("{}:{}", client_id, auth_token);
-            let (encrypted_syn_payload, _) = client_session_cipher.encrypt(syn_payload_plaintext.as_bytes())?; // Nonce included in packet header
+            let (encrypted_syn_payload, _) = client_session_cipher.encrypt(syn_payload_plaintext.as_bytes())?;
 
             let mut syn_flags = IrpFlags::new();
             syn_flags.syn = true;
 
-            // No padding for SYN packets, as it's a control packet.
             let syn_packet = IrpPacket::new(
                 tunnel_id,
-                custom_rng_gen_u32(), // Client's initial sequence number
-                0, // ACK number not relevant for SYN
+                custom_rng_gen_u32(),
+                0,
                 syn_flags,
-                client_ephemeral_nonce, // Send ephemeral nonce in SYN packet
-                Vec::new(), // No padding for control packets
+                client_ephemeral_nonce,
+                Vec::new(),
                 encrypted_syn_payload,
             );
 
             info!("Attempting SYN handshake via {} to {}", protocol_used_str, remote_ip);
-            let syn_raw_socket = Arc::new(PlatformRawSocket::new(local_ip)?); // Create temporary socket for handshake
+            let syn_raw_socket = Arc::new(PlatformRawSocket::new(local_ip)?);
 
             let syn_send_result = CovertTunnelStream::send_irp_packet(&syn_raw_socket, remote_ip, protocol_type_u8, &syn_packet).await;
             if syn_send_result.is_err() {
@@ -1901,7 +1785,7 @@ impl IrfarpClient {
             ).await;
 
             match syn_ack_timeout {
-                Ok(Ok((n, src_addr))) => { // FIX: src_addr is in scope here
+                Ok(Ok((n, src_addr))) => {
                     if src_addr.ip() == remote_ip {
                         if let Some(parsed_data) = parse_ipv4_packet(&recv_buf[..n]) {
                             let (_, _, proto, payload, _) = parsed_data;
@@ -1909,49 +1793,45 @@ impl IrfarpClient {
                                 match IrpPacket::from_bytes(&payload) {
                                     Ok(irp_packet) => {
                                         if irp_packet.header.tunnel_id == tunnel_id && irp_packet.header.flags.syn && irp_packet.header.flags.ack {
-                                            // Decrypt SYN-ACK payload (should be empty but verifies key)
                                             match client_session_cipher.decrypt(&irp_packet.encrypted_payload, &irp_packet.header.nonce) {
                                                 Ok(_) => {
                                                     info!("Received SYN-ACK for tunnel ID: {:?} via {}.", tunnel_id, protocol_used_str);
 
-                                                    // Create the actual tunnel stream and transition to Established
                                                     let new_tunnel = CovertTunnelStream::new(
-                                                        local_ip, remote_ip, tunnel_id, protocol_type_u8, client_session_cipher.clone(), // FIX: Pass client_session_cipher
+                                                        local_ip, remote_ip, tunnel_id, protocol_type_u8, client_session_cipher.clone(),
                                                         initial_rto_ms_val, max_rto_ms_val,
                                                         irp_obfuscation_min_padding, irp_obfuscation_max_padding,
                                                     ).await?;
-                                                    // Set initial sequence numbers based on handshake
-                                                    *new_tunnel.next_send_seq.lock().unwrap() = syn_packet.header.sequence_num + 1;
-                                                    *new_tunnel.next_recv_seq.lock().unwrap() = irp_packet.header.sequence_num + 1;
-                                                    *new_tunnel.connection_state.lock().unwrap() = ConnectionState::Established;
+                                                    *new_tunnel.next_send_seq.lock().await = syn_packet.header.sequence_num + 1; // FIX: .lock().await
+                                                    *new_tunnel.next_recv_seq.lock().await = irp_packet.header.sequence_num + 1; // FIX: .lock().await
+                                                    *new_tunnel.connection_state.lock().await = ConnectionState::Established; // FIX: .lock().await
 
                                                     tunnel_stream = Some(Arc::new(Mutex::new(new_tunnel)));
-                                                    active_tunnels.lock().unwrap().insert(service_id.clone(), tunnel_stream.as_ref().unwrap().clone());
+                                                    active_tunnels.lock().await.insert(service_id.clone(), tunnel_stream.as_ref().unwrap().clone()); // FIX: .lock().await
 
-                                                    // Send final ACK for handshake
                                                     let mut ack_flags = IrpFlags::new();
                                                     ack_flags.ack = true;
                                                     let (encrypted_payload_ack, nonce_ack) = client_session_cipher.encrypt(&[]).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
                                                     let ack_packet = IrpPacket::new(
                                                         tunnel_id,
-                                                        *tunnel_stream.as_ref().unwrap().lock().unwrap().next_send_seq.lock().unwrap(), // Client's next sequence (after SYN)
-                                                        *tunnel_stream.as_ref().unwrap().lock().unwrap().next_recv_seq.lock().unwrap(), // Acknowledge server's SYN-ACK
+                                                        *tunnel_stream.as_ref().unwrap().lock().await.next_send_seq.lock().await, // FIX: .lock().await
+                                                        *tunnel_stream.as_ref().unwrap().lock().await.next_recv_seq.lock().await, // FIX: .lock().await
                                                         ack_flags,
                                                         nonce_ack,
-                                                        Vec::new(), // No padding for control packets
+                                                        Vec::new(),
                                                         encrypted_payload_ack,
                                                     );
                                                     if let Err(e) = CovertTunnelStream::send_irp_packet(&syn_raw_socket, remote_ip, protocol_type_u8, &ack_packet).await {
                                                         error!("Failed to send final ACK: {}", e);
                                                     }
-                                                    break; // Handshake successful
+                                                    break;
                                                 },
                                                 Err(e) => {
-                                                    warn!("SYN-ACK decryption failed from {}: {}. Possible key mismatch or attack. Retrying...", src_addr.ip(), e); // FIX: Use src_addr.ip()
+                                                    warn!("SYN-ACK decryption failed from {}: {}. Possible key mismatch or attack. Retrying...", src_addr.ip(), e);
                                                 }
                                             }
                                         } else {
-                                            warn!("Received non-{} protocol packet during SYN-ACK from {}. Retrying...", protocol_used_str, src_addr.ip()); // FIX: Use src_addr.ip()
+                                            warn!("Received non-{} protocol packet during SYN-ACK from {}. Retrying...", protocol_used_str, src_addr.ip());
                                         }
                                     },
                                     Err(e) => {
@@ -1959,7 +1839,7 @@ impl IrfarpClient {
                                     }
                                 }
                             } else {
-                                warn!("Received packet from unexpected protocol {} during SYN-ACK from {}. Expected {}. Retrying...", proto, src_addr.ip(), protocol_type_u8); // FIX: Use src_addr.ip()
+                                warn!("Received packet from unexpected protocol {} during SYN-ACK from {}. Expected {}. Retrying...", proto, src_addr.ip(), protocol_type_u8);
                             }
                         }
                     }
@@ -1979,39 +1859,38 @@ impl IrfarpClient {
             io::Error::new(io::ErrorKind::TimedOut, "Failed to establish covert tunnel")
         })?;
 
-        // Proxy data between local TCP service and CovertTunnelStream
-        // Once a covert tunnel is established, this section handles the continuous
-        // flow of application data (e.g., SSH, web traffic) through the tunnel.
-        // It manages buffering, encryption/decryption, and sending/receiving
-        // data packets over the chosen covert protocol.
         let start_time = SystemTime::now();
         let mut uploaded_bytes: u64 = 0;
         let mut downloaded_bytes: u64 = 0;
 
-        let tunnel_stream_locked_for_proxy = tunnel_stream_arc.clone(); // Clone for proxy tasks
+        let tunnel_stream_locked_for_proxy = tunnel_stream_arc.clone();
 
         let (mut local_reader, mut local_writer) = local_stream.split();
 
+        let local_to_tunnel_task_uploaded_bytes = Arc::new(Mutex::new(0u64)); // FIX: New Arc<Mutex<u64>> for shared counter
+        let tunnel_to_local_task_downloaded_bytes = Arc::new(Mutex::new(0u64)); // FIX: New Arc<Mutex<u64>> for shared counter
+
         let local_to_tunnel_task = async {
-            // Resource management: Allocate buffer once
             let max_payload_size = MAX_IP_PAYLOAD_SIZE - CUSTOM_IRFARP_HEADER_SIZE - irp_obfuscation_max_padding;
             let mut buf: Vec<u8> = vec![0; max_payload_size];
             loop {
                 let n = local_reader.read(&mut buf).await?;
                 if n == 0 { break; }
-                let mut tunnel = tunnel_stream_locked_for_proxy.lock().unwrap();
+                let mut tunnel = tunnel_stream_locked_for_proxy.lock().await; // FIX: .lock().await
                 tunnel.write_data(&buf[..n]).await?;
-                uploaded_bytes += n as u64; // Client uploads to tunnel
+                *local_to_tunnel_task_uploaded_bytes.lock().await += n as u64; // FIX: .lock().await
             }
             Ok::<(), io::Error>(())
         };
 
         let tunnel_to_local_task = async {
             loop {
-                let mut tunnel = tunnel_stream_locked_for_proxy.lock().unwrap();
-                let data = tunnel.read_data().await?;
+                let data = {
+                    let mut tunnel = tunnel_stream_locked_for_proxy.lock().await; // FIX: .lock().await
+                    tunnel.read_data().await?
+                };
                 local_writer.write_all(&data).await?;
-                downloaded_bytes += data.len() as u64; // Client downloads from tunnel
+                *tunnel_to_local_task_downloaded_bytes.lock().await += data.len() as u64; // FIX: .lock().await
             }
             Ok::<(), io::Error>(())
         };
@@ -2021,34 +1900,33 @@ impl IrfarpClient {
             res2 = tunnel_to_local_task => res2,
         };
 
+        // Retrieve final byte counts after tasks complete
+        uploaded_bytes = *local_to_tunnel_task_uploaded_bytes.lock().await; // FIX: .lock().await
+        downloaded_bytes = *tunnel_to_local_task_downloaded_bytes.lock().await; // FIX: .lock().await
+
         let end_time = SystemTime::now();
         let duration = end_time.duration_since(start_time).unwrap_or_default().as_secs();
         let status = if result.is_ok() { "success" } else { "failure" };
-        let error_message = result.err().map(|e| e.to_string());
+        let error_message = result.as_ref().err().map(|e| e.to_string());
 
-        // Send metrics
-        // These metrics are crucial for monitoring the performance and effectiveness
-        // of the covert communication, providing data for auditing and further optimization.
         let final_metrics = ConnectionMetrics {
-            timestamp_ms: end_time.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64, // FIX: Cast to u64
+            timestamp_ms: end_time.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
             client_id,
             service_id,
-            bytes_uploaded: uploaded_bytes, // FIX: Correct variable name
-            bytes_downloaded: downloaded_bytes, // FIX: Correct variable name
+            bytes_uploaded,
+            bytes_downloaded,
             duration_sec: duration,
             status: status.to_string(),
             error_message,
             peer_addr: local_peer_addr.to_string(),
             server_addr: final_remote_ip_str,
             protocol_used: protocol_used_str,
-            // Removed: retransmissions, rtt_avg_ms, packet_loss_rate
         };
         if let Err(e) = metrics_sender.send(final_metrics).await {
             error!("Failed to send metrics: {}", e);
         }
 
-        // Initiate graceful close on the tunnel
-        let mut tunnel = tunnel_stream_locked_for_proxy.lock().unwrap();
+        let mut tunnel = tunnel_stream_locked_for_proxy.lock().await; // FIX: .lock().await
         if let Err(e) = tunnel.close().await {
             error!("Error closing tunnel gracefully: {}", e);
         }
@@ -2110,11 +1988,8 @@ const CLIENT_CONFIG_EXAMPLE: &str = r#"{
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // Initialize custom PRNG with a time-based seed for non-crypto randoms (e.g., ICMP ID/Seq hopping).
-    // For crypto-sensitive randoms, `rand::rngs::OsRng` is used.
     custom_rng_seed(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
 
-    // Setup logging (default to Info until config is loaded)
     Builder::new()
         .filter_level(log::LevelFilter::Info)
         .target(Target::Stdout)
@@ -2148,7 +2023,6 @@ async fn main() -> io::Result<()> {
             }
             let config_file = &args[2];
             let (server, mut metrics_receiver) = IrfarpServer::new(config_file).await?;
-            // Re-initialize logger with config-defined level
             Builder::new()
                 .filter_level(server.config.log_level.parse().unwrap_or(log::LevelFilter::Info))
                 .target(Target::Stdout)
@@ -2157,11 +2031,6 @@ async fn main() -> io::Result<()> {
 
             let metrics_interval_sec = server.config.metrics_interval_sec;
 
-            // Spawn a task to process metrics
-            // This task periodically collects and logs connection metrics from active tunnels.
-            // In a production banking-grade system, these metrics would be forwarded to a
-            // secure, persistent monitoring system (e.g., Prometheus, Splunk, custom database)
-            // for real-time dashboards, alerts, and long-term auditing.
             tokio::spawn(async move {
                 let mut interval = time::interval(Duration::from_secs(metrics_interval_sec));
                 let mut collected_metrics: Vec<ConnectionMetrics> = Vec::new();
@@ -2194,20 +2063,16 @@ async fn main() -> io::Result<()> {
             }
             let config_file = &args[2];
             let (client, mut metrics_receiver) = IrfarpClient::new(config_file).await?;
-            // Re-initialize logger with config-defined level
             Builder::new()
                 .filter_level(client.config.log_level.parse().unwrap_or(log::LevelFilter::Info))
                 .target(Target::Stdout)
                 .init();
             info!("Client logging initialized at {} level.", client.config.log_level);
 
-            // Removed: probe_interval_sec
             let client_id_for_metrics = client.config.client_id.clone();
 
-            // Spawn a task for client-side metrics processing
-            // This task processes metrics received from active tunnels for basic monitoring.
             tokio::spawn(async move {
-                let mut interval = time::interval(Duration::from_secs(60)); // Fixed interval for metrics logging
+                let mut interval = time::interval(Duration::from_secs(60));
                 let mut collected_metrics: Vec<ConnectionMetrics> = Vec::new();
 
                 loop {
@@ -2219,7 +2084,7 @@ async fn main() -> io::Result<()> {
                             if !collected_metrics.is_empty() {
                                 info!("--- Client Metrics Report ({} connections) for {} ---", collected_metrics.len(), client_id_for_metrics);
                                 for metric in &collected_metrics {
-                                    debug!("{:?}", metric); // Use debug for individual metrics, info for summary
+                                    debug!("{:?}", metric);
                                 }
                                 collected_metrics.clear();
                                 info!("------------------------------------");
