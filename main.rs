@@ -27,14 +27,14 @@ use std::{
 
 // External crate imports (crucial for security and reliability)
 use aes_gcm::{
-    aead::{Aead, KeyInit, Nonce},
+    aead::{Aead, KeyInit},
     Aes256Gcm,
 };
-use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use bincode::{deserialize, serialize};
 use byteorder::{BigEndian, ByteOrder};
 use env_logger::{Builder, Target};
+use generic_array::GenericArray;
 use hkdf::Hkdf;
 use log::{debug, error, info, trace, warn};
 use rand::{rngs::OsRng, RngCore, Rng};
@@ -44,16 +44,17 @@ use tokio::{
     sync::{mpsc, Mutex},
     time,
 };
+use typenum::U12;
 
 // Linux-specific imports for raw sockets
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 #[cfg(target_os = "linux")]
-use libc::{setsockopt, IP_HDRINCL, IPPROTO_IP};
+use libc::{setsockopt, IP_HDRINCL birthplace:// IPPROTO_IP};
 
 // --- Custom Pseudo-Random Number Generator (PRNG) for Non-Crypto Uses ---
 // Used for non-security-critical values (e.g., ICMP ID/Sequence hopping).
-// NOT CRYPTOGRAPHICALLY SEC “
+// NOT CRYPTOGRAPHICALLY SECURE
 
 static mut PRNG_STATE: u64 = 0;
 
@@ -125,7 +126,7 @@ impl IrpCipher {
     /// Encrypts plaintext, returning ciphertext and a 12-byte nonce.
     fn encrypt(&self, plaintext: &[u8]) -> io::Result<(Vec<u8>, [u8; 12])> {
         let nonce_bytes = get_csprng_bytes::<12>();
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = GenericArray::from_slice(&nonce_bytes);
         self.cipher
             .encrypt(nonce, plaintext)
             .map(|ciphertext| (ciphertext, nonce_bytes))
@@ -134,7 +135,7 @@ impl IrpCipher {
 
     /// Decrypts ciphertext using the provided nonce.
     fn decrypt(&self, ciphertext: &[u8], nonce_bytes: &[u8; 12]) -> io::Result<Vec<u8>> {
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = GenericArray::from_slice(nonce_bytes);
         self.cipher
             .decrypt(nonce, ciphertext)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
@@ -472,25 +473,14 @@ fn parse_ipv4_packet(
 
 // --- OS Abstraction Layer for Raw Sockets ---
 
-#[async_trait]
-trait RawSocketTrait: Send + Sync {
-    fn new(local_ip: IpAddr) -> io::Result<Self>
-    where
-        Self: Sized;
-    async fn send_raw_packet(&self, remote_ip: IpAddr, raw_packet: &[u8]) -> io::Result<usize>;
-    async fn recv_raw_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
-    fn local_ip(&self) -> IpAddr;
-}
-
-/// Linux-specific raw socket implementation.
+#[cfg(target_os = "linux")]
 struct LinuxRawSocket {
     socket: UdpSocket,
     local_ip_addr: IpAddr,
 }
 
-#[async_trait]
-impl RawSocketTrait for LinuxRawSocket {
-    #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+impl LinuxRawSocket {
     fn new(local_ip: IpAddr) -> io::Result<Self> {
         let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0))?;
         socket.set_nonblocking(true)?;
@@ -514,8 +504,55 @@ impl RawSocketTrait for LinuxRawSocket {
             local_ip_addr: local_ip,
         })
     }
+}
 
-    #[cfg(not(target_os = "linux"))]
+/// Platform-agnostic raw socket wrapper.
+#[cfg(target_os = "linux")]
+struct PlatformRawSocket {
+    inner: LinuxRawSocket,
+}
+
+#[cfg(not(target_os = "linux"))]
+struct PlatformRawSocket;
+
+#[cfg(target_os = "linux")]
+impl PlatformRawSocket {
+    fn new(local_ip: IpAddr) -> io::Result<Self> {
+        Ok(PlatformRawSocket {
+            inner: LinuxRawSocket::new(local_ip)?,
+        })
+    }
+
+    async fn send_raw_packet(&self, remote_ip: IpAddr, raw_packet: &[u8]) -> io::Result<usize> {
+        let socket = self.inner.socket.try_clone()?;
+        let packet = raw_packet.to_vec();
+        let remote_addr = SocketAddr::new(remote_ip, 0);
+        tokio::task::spawn_blocking(move || socket.send_to(&packet, remote_addr))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Send error: {}", e)))?
+    }
+
+    async fn recv_raw_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let socket = self.inner.socket.try_clone()?;
+        loop {
+            match tokio::task::spawn_blocking(move || socket.recv_from(buf)).await {
+                Ok(Ok((n, addr))) => return Ok((n, addr)),
+                Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
+            }
+        }
+    }
+
+    fn local_ip(&self) -> IpAddr {
+        self.inner.local_ip_addr
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PlatformRawSocket {
     fn new(_local_ip: IpAddr) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -523,54 +560,22 @@ impl RawSocketTrait for LinuxRawSocket {
         ))
     }
 
-    async fn send_raw_packet(&self, remote_ip: IpAddr, raw_packet: &[u8]) -> io::Result<usize> {
-        let socket = self.socket.try_clone()?;
-        let packet = raw_packet.to_vec();
-        tokio::task::spawn_blocking(move || socket.send_to(&packet, SocketAddr::new(remote_ip, 0)))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Send error: {}", e)))?
-    }
-
-    async fn recv_raw_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let socket = self.socket.try_clone()?;
-        tokio::task::spawn_blocking(move || socket.recv_from(buf))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Recv error: {}", e)))?
-    }
-
-    fn local_ip(&self) -> IpAddr {
-        self.local_ip_addr
-    }
-}
-
-/// Platform-agnostic raw socket wrapper.
-struct PlatformRawSocket {
-    inner: Box<dyn RawSocketTrait + Send + Sync>,
-}
-
-impl PlatformRawSocket {
-    fn new(local_ip: IpAddr) -> io::Result<Self> {
-        #[cfg(target_os = "linux")]
-        return Ok(PlatformRawSocket {
-            inner: Box::new(LinuxRawSocket::new(local_ip)?),
-        });
-        #[cfg(not(target_os = "linux"))]
+    async fn send_raw_packet(&self, _remote_ip: IpAddr, _raw_packet: &[u8]) -> io::Result<usize> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Raw sockets not supported on this OS",
         ))
     }
 
-    async fn send_raw_packet(&self, remote_ip: IpAddr, raw_packet: &[u8]) -> io::Result<usize> {
-        self.inner.send_raw_packet(remote_ip, raw_packet).await
-    }
-
-    async fn recv_raw_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.inner.recv_raw_packet(buf).await
+    async fn recv_raw_packet(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Raw sockets not supported on this OS",
+        ))
     }
 
     fn local_ip(&self) -> IpAddr {
-        self.inner.local_ip()
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     }
 }
 
@@ -1414,7 +1419,12 @@ impl IrfarpClient {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    custom_rng_seed(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+    custom_rng_seed(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .as_secs(),
+    );
     Builder::new()
         .filter_level(log::LevelFilter::Info)
         .target(Target::Stdout)
